@@ -62,7 +62,7 @@ def parse_scores(response_text, num_models):
     for k, v in scores.items():
         if 1 <= v <= 5:
             valid_scores[k] = v
-    
+
     return valid_scores
 
 def score_translations(js_data):
