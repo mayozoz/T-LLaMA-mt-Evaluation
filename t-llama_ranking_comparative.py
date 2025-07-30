@@ -2,38 +2,86 @@ import json
 import os
 import sys
 import re
+import torch
+import concurrent.futures
 from tqdm import tqdm
+from huggingface_hub import snapshot_download
 from concurrent.futures import ThreadPoolExecutor
 from transformers import LlamaTokenizer, AutoModelForCausalLM
 
 # Initialize T-LLaMA
-model_path = "/ssd11/other/meiyy02/code_files/mt-corpus/T-LLaMA/T-LLaMA"
+# model_path = "/ssd11/other/meiyy02/code_files/mt-corpus/T-LLaMA/T-LLaMA"
+model_path = snapshot_download(
+    repo_id="Pagewood/T-LLaMA",
+    local_dir="./T-LLaMA-downloaded",
+    resume_download=True
+)
+
+print("Loading tokenizer...")
 tokenizer = LlamaTokenizer.from_pretrained(model_path)
-model = AutoModelForCausalLM.from_pretrained(model_path)
+print("Loading model...")
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    # torch_load_kwargs={'weights_only': False},
+    torch_dtype=torch.float16,
+    device_map="auto",
+    trust_remote_code=True
+)
+print("Loaded successfully!")
+
+# Quick test
+test_prompt = "Rate this translation from 1-5: Source: Hello. Translation: Bonjour."
+test_inputs = tokenizer(test_prompt, return_tensors="pt")
+if torch.cuda.is_available():
+    test_inputs = {k: v.cuda for k, v in test_inputs.items()}
+with torch.no_grad():
+    test_outputs = model.generate(**test_inputs, max_length=100, temperature=0.7)
+test_response = tokenizer.decode(test_outputs[0], skip_special_tokens=True)
+print("Test resonse:", test_response)
+
+# def get_comparative_prompt(source, translations, model_names):
+#     prompt = f"""Compare and score these {len(translations)} translations of the same source text:
+    
+# Source: {source}
+
+# """
+#     for i, (trans, name) in enumerate(zip(translations, model_names)):
+#         prompt += f"Translation {chr(65+i)} ({name}): {trans}\n\n"
+
+#     prompt += """Evaluate each translation on these criteria (1-5 scale):
+# 1. Accuracy (faithfulness to source)
+# 2. Fluency (naturalness in target language)
+# 3. Style (appropriate tone/register)
+# 4. Grammar (technical correctness)
+
+# SCORING KEY:
+# 5 = Excellent, 4 = Good, 3 = Adequate, 2 = Poor, 1 = Very poor
+
+# Provide ONLY the scores in this exact format:
+# Translation A: [score]
+# Translation B: [score]
+# Translation C: [score]"""
+#     return prompt
+
 
 def get_comparative_prompt(source, translations, model_names):
-    prompt = f"""Compare and score these {len(translations)} translations of the same source text:
-    
+    prompt = f"""Evaluate these translations from Tibetan to Chinese. Assign each a score (1-5) based on:
+- Accuracy (matches source meaning)
+- Fluency (natural Chinese)
+- Grammar (correct syntax)
+
 Source: {source}
 
 """
     for i, (trans, name) in enumerate(zip(translations, model_names)):
-        prompt += f"Translation {chr(65+i)} ({name}): {trans}\n\n"
+        prompt += f"{name}: {trans}\n"
 
-    prompt += """Evaluate each translation on these criteria (1-5 scale):
-1. Accuracy (faithfulness to source)
-2. Fluency (naturalness in target language)
-3. Style (appropriate tone/register)
-4. Grammar (technical correctness)
-
-SCORING KEY:
-5 = Excellent, 4 = Good, 3 = Adequate, 2 = Poor, 1 = Very poor
-
-Provide ONLY the scores in this exact format:
-Translation A: [score]
-Translation B: [score]
-Translation C: [score]"""
+    prompt += """\nScores ONLY in this format:
+modelA.txt: [score]
+modelB.txt: [score]
+modelC.txt: [score]"""
     return prompt
+
 
 def parse_scores(response_text, num_models):
     scores = {}
@@ -73,14 +121,19 @@ def score_translations(js_data):
     prompt = get_comparative_prompt(source, translations, model_names)
     inputs = tokenizer(prompt, return_tensors="pt")
     
+    if torch.cuda.is_available():
+        inputs = {k: v.cuda() for k, v in inputs.items()}
     try:
-        outputs = model.generate(
-            **inputs,
-            max_length=512,
-            temperature=0.3,
-            top_p=0.9,
-            num_return_sequences=1
-        )
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_length=512,
+                temperature=0.3,
+                top_p=0.9,
+                num_return_sequences=1,
+                pad_token_id=tokenizer.eos_token_id,
+                do_sample=True
+            )
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
         
         scores = parse_scores(response, len(translations))
@@ -111,8 +164,8 @@ def score_translations(js_data):
 def main(src_file, *tgt_files):
     """
     usage:
-    python3 T-LLaMA/t-llama_ranking_comparative.py tbt-cn-200/src_clean.txt tbt-cn-200/mt-hyps/hyp_deepseek-v3 tbt-cn-200/mt-hyps/hyp_google-translate tbt-cn-200/mt-hyps/hyp_qwen2.5_72b
-    HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python3 T-LLaMA/t-llama_ranking_comparative.py tbt-cn-200/src_clean.txt tbt-cn-200/mt-hyps/hyp_deepseek-v3 tbt-cn-200/mt-hyps/hyp_google-translate tbt-cn-200/mt-hyps/hyp_qwen2.5_72b
+HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python3 T-LLaMA/t-llama_ranking_comparative.py tbt-cn-200/src_clean.txt tbt-cn-200/mt-hyps/hyp_deepseek-v3 tbt-cn-200/mt-hyps/hyp_google-translate tbt-cn-200/mt-hyps/hyp_qwen2.5_72b
+HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python3 T-LLaMA/t-llama_ranking_comparative.py tbt-cn-200/test-mt-hyps/src.txt tbt-cn-200/test-mt-hyps/modelA.txt tbt-cn-200/test-mt-hyps/modelB.txt tbt-cn-200/test-mt-hyps/modelC.txt
     """
     # Load data
     with open(src_file, 'r', encoding='utf-8') as f:
@@ -144,7 +197,7 @@ def main(src_file, *tgt_files):
     
     # Process with threading
     results = []
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(score_translations, job) for job in jobs]
         for future in tqdm(concurrent.futures.as_completed(futures), 
                           total=len(futures), 
@@ -154,7 +207,8 @@ def main(src_file, *tgt_files):
     # Sort and save results
     results.sort(key=lambda x: x['id'])
     
-    output_dir = "tbt-cn-200/T-LLaMA_mev_scores"
+    # output_dir = "tbt-cn-200/T-LLaMA_mev_scores"
+    output_dir = "tbt-cn-200/test-mt-hyps/A-B-C"
     os.makedirs(output_dir, exist_ok=True)
     
     # Save detailed results
